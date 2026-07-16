@@ -141,8 +141,18 @@ function Index() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Incoming: chunks are appended as they arrive; survives reconnects.
+  // hashPromise is a chained promise that folds every chunk into a running
+  // SHA-256 state as it arrives, so verification cost is amortized.
   const incomingRef = useRef<
-    Record<string, { meta: Meta; chunks: ArrayBuffer[]; received: number }>
+    Record<
+      string,
+      {
+        meta: Meta;
+        chunks: ArrayBuffer[];
+        received: number;
+        hashPromise: Promise<Uint8Array<ArrayBuffer>>;
+      }
+    >
   >({});
   // Which incoming id is currently receiving binary chunks (set by the last "meta"
   // received or by a resume announcement).
@@ -325,6 +335,10 @@ function Index() {
       if (!entry) return;
       entry.chunks.push(buf);
       entry.received += buf.byteLength;
+      // Fold the chunk into the running hash without blocking the receive path.
+      entry.hashPromise = entry.hashPromise.then((state) =>
+        foldChunkIntoHash(state, buf),
+      );
       setTransfers((prev) =>
         prev.map((t) =>
           t.id === activeId ? { ...t, received: entry.received, status: "transferring" } : t,
@@ -336,7 +350,12 @@ function Index() {
     if (sig.kind === "meta") {
       // A fresh transfer — or an announcement that this id is what follows next.
       if (!incomingRef.current[sig.id]) {
-        incomingRef.current[sig.id] = { meta: sig, chunks: [], received: 0 };
+        incomingRef.current[sig.id] = {
+          meta: sig,
+          chunks: [],
+          received: 0,
+          hashPromise: Promise.resolve(new Uint8Array(new ArrayBuffer(32))),
+        };
         setTransfers((prev) => [
           {
             id: sig.id,
@@ -349,6 +368,10 @@ function Index() {
           },
           ...prev,
         ]);
+      } else {
+        // Meta re-announced after a reconnect — update the expected hash if
+        // the sender only computed it after the first meta went out.
+        incomingRef.current[sig.id].meta = sig;
       }
       activeIncomingIdRef.current = sig.id;
     } else if (sig.kind === "done") {
