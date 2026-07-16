@@ -45,18 +45,24 @@ function formatBytes(bytes: number) {
 // deterministic strong integrity hash both sides can compute incrementally
 // without loading the whole file into memory. Chunks must be sliced at the
 // same size on both sides (CHUNK_SIZE) for hashes to match — which they are.
-async function digestBytes(bytes: BufferSource): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+async function digestBytes(bytes: BufferSource): Promise<Uint8Array<ArrayBuffer>> {
+  const d = await crypto.subtle.digest("SHA-256", bytes);
+  return new Uint8Array(d);
 }
 async function foldChunkIntoHash(
-  state: Uint8Array,
+  state: Uint8Array<ArrayBuffer>,
   chunk: BufferSource,
-): Promise<Uint8Array> {
+): Promise<Uint8Array<ArrayBuffer>> {
   const chunkHash = await digestBytes(chunk);
   const combined = new Uint8Array(state.length + chunkHash.length);
   combined.set(state, 0);
   combined.set(chunkHash, state.length);
   return digestBytes(combined);
+}
+function toHex(bytes: Uint8Array<ArrayBuffer>): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 function toHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -68,7 +74,7 @@ async function hashFileChained(
   chunkSize: number,
   onProgress?: (done: number, total: number) => void,
 ): Promise<string> {
-  let state = new Uint8Array(32);
+  let state = new Uint8Array(new ArrayBuffer(32));
   for (let off = 0; off < file.size; off += chunkSize) {
     const buf = await file.slice(off, off + chunkSize).arrayBuffer();
     state = await foldChunkIntoHash(state, buf);
