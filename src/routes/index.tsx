@@ -64,11 +64,6 @@ function toHex(bytes: Uint8Array<ArrayBuffer>): string {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
-function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
 async function hashFileChained(
   file: File,
   chunkSize: number,
