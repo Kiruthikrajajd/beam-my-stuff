@@ -205,8 +205,8 @@ function Index() {
         const slice = file.slice(offset, offset + CHUNK_SIZE);
         const buf = await slice.arrayBuffer();
         // backpressure
-        // @ts-expect-error peerjs internal
-        while (conn.dataChannel && conn.dataChannel.bufferedAmount > 16 * 1024 * 1024) {
+        const dc = (conn as unknown as { dataChannel?: RTCDataChannel }).dataChannel;
+        while (dc && dc.bufferedAmount > 16 * 1024 * 1024) {
           await new Promise((r) => setTimeout(r, 50));
         }
         conn.send(buf);
