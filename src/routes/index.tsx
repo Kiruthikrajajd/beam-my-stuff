@@ -835,23 +835,46 @@ function Index() {
               Transfers
             </h3>
             {transfers.map((t) => {
-              const pct = t.size ? Math.min(100, (t.received / t.size) * 100) : 0;
+              // Progress bar reflects hashing while status === "hashing",
+              // otherwise byte progress.
+              const isHashing = t.status === "hashing";
+              const pct = isHashing
+                ? Math.round((t.hashProgress ?? 0) * 100)
+                : t.size
+                  ? Math.min(100, (t.received / t.size) * 100)
+                  : 0;
               const barColor =
-                t.status === "done"
+                t.status === "verified" || t.status === "done"
                   ? "bg-emerald-500"
-                  : t.status === "paused"
-                    ? "bg-amber-500"
-                    : t.status === "error"
-                      ? "bg-destructive"
-                      : "bg-primary";
-              const statusText =
-                t.status === "done"
-                  ? " · Complete"
-                  : t.status === "paused"
-                    ? " · Paused, will resume"
-                    : t.status === "error"
-                      ? " · Failed"
-                      : "";
+                  : t.status === "corrupted" || t.status === "error"
+                    ? "bg-destructive"
+                    : t.status === "paused"
+                      ? "bg-amber-500"
+                      : t.status === "hashing" || t.status === "verifying"
+                        ? "bg-muted-foreground/50"
+                        : "bg-primary";
+              const statusText: Record<TransferStatus, string> = {
+                hashing: " · Preparing (hashing)",
+                transferring: "",
+                paused: " · Paused, will resume",
+                verifying: " · Verifying…",
+                verified: " · Verified ✓",
+                corrupted: " · Corrupted ✗",
+                done: " · Complete",
+                error: " · Failed",
+              };
+              const badge =
+                t.status === "verified" ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600">
+                    <CheckIcon />
+                    Verified
+                  </span>
+                ) : t.status === "corrupted" ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                    <WarnIcon />
+                    Corrupted
+                  </span>
+                ) : null;
               return (
                 <div key={t.id} className="rounded-2xl border bg-card p-4">
                   <div className="flex items-center gap-3">
@@ -865,19 +888,34 @@ function Index() {
                       {t.direction === "in" ? <DownIcon /> : <UpIcon />}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">{t.name}</p>
+                      <div className="flex items-center gap-2">
+                        <p className="truncate text-sm font-medium">{t.name}</p>
+                        {badge}
+                      </div>
                       <p className="text-xs text-muted-foreground">
                         {formatBytes(t.received)} / {formatBytes(t.size)}
-                        {statusText}
+                        {statusText[t.status]}
                       </p>
                     </div>
-                    {t.status === "done" && t.direction === "in" && t.url && (
+                    {(t.status === "verified" || t.status === "done") &&
+                      t.direction === "in" &&
+                      t.url && (
+                        <a
+                          href={t.url}
+                          download={t.name}
+                          className="rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"
+                        >
+                          Save
+                        </a>
+                      )}
+                    {t.status === "corrupted" && t.direction === "in" && t.url && (
                       <a
                         href={t.url}
                         download={t.name}
-                        className="rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"
+                        className="rounded-full border border-destructive px-3 py-1.5 text-xs font-medium text-destructive"
+                        title="File failed integrity check. Save at your own risk."
                       >
-                        Save
+                        Save anyway
                       </a>
                     )}
                   </div>
