@@ -255,13 +255,14 @@ function Index() {
         ArrayBuffer.isView(data as ArrayBufferView) &&
         !(data as { kind?: string }).kind)
     ) {
-      const buf =
+      const view = data instanceof ArrayBuffer ? null : (data as ArrayBufferView);
+      const buf: ArrayBuffer =
         data instanceof ArrayBuffer
           ? data
-          : (data as ArrayBufferView).buffer.slice(
-              (data as ArrayBufferView).byteOffset,
-              (data as ArrayBufferView).byteOffset + (data as ArrayBufferView).byteLength,
-            );
+          : (view!.buffer.slice(
+              view!.byteOffset,
+              view!.byteOffset + view!.byteLength,
+            ) as ArrayBuffer);
       const activeId = activeIncomingIdRef.current;
       if (!activeId) return;
       const entry = incomingRef.current[activeId];
