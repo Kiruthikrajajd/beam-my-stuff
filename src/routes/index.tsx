@@ -16,7 +16,7 @@ export const Route = createFileRoute("/")({
       {
         property: "og:description",
         content:
-          "Share a code, transfer files directly between your devices with end-to-end encrypted WebRTC.",
+          "Peer-to-peer file transfer between phone, tablet, laptop and desktop. Auto-resumes if the connection drops.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },

@@ -78,12 +78,16 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "Beam — Send files between any device" },
-      { name: "description", content: "Peer-to-peer file transfer between phone, tablet, laptop and desktop. No sign-up, no size limits." },
+      { name: "description", content: "Peer-to-peer file transfer between phone, tablet, laptop and desktop. Auto-resumes if the connection drops." },
       { name: "author", content: "Beam" },
       { property: "og:title", content: "Beam — Send files between any device" },
-      { property: "og:description", content: "Direct, encrypted device-to-device file transfer via WebRTC." },
+      { property: "og:description", content: "Peer-to-peer file transfer between phone, tablet, laptop and desktop. Auto-resumes if the connection drops." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:title", content: "Beam — Send files between any device" },
+      { name: "twitter:description", content: "Peer-to-peer file transfer between phone, tablet, laptop and desktop. Auto-resumes if the connection drops." },
+      { property: "og:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/attachments/og-images/5bef7eaf-ba35-4bb8-b534-faa081ffd485" },
+      { name: "twitter:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/attachments/og-images/5bef7eaf-ba35-4bb8-b534-faa081ffd485" },
     ],
     links: [
       {
