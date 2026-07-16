@@ -487,6 +487,49 @@ function Index() {
     if (p) setRemoteId(p);
   }, []);
 
+  // ---------- Wake Lock: keep the screen (and this page) alive while ----------
+  // transfers are running. On mobile this is the actual mechanism that prevents
+  // the OS from suspending the tab and freezing the WebRTC data channel when
+  // the screen would otherwise lock. Re-acquired on visibility change because
+  // some browsers drop the lock when the tab goes to the background.
+  const hasActiveTransfer = transfers.some(
+    (t) => t.status === "transferring" || t.status === "paused",
+  );
+  useEffect(() => {
+    if (!hasActiveTransfer) return;
+    type WakeLockSentinel = { release: () => Promise<void> };
+    type NavWithWakeLock = Navigator & {
+      wakeLock?: { request: (type: "screen") => Promise<WakeLockSentinel> };
+    };
+    const nav = navigator as NavWithWakeLock;
+    if (!nav.wakeLock) return;
+    let sentinel: WakeLockSentinel | null = null;
+    let cancelled = false;
+    const acquire = async () => {
+      try {
+        const s = await nav.wakeLock!.request("screen");
+        if (cancelled) {
+          void s.release();
+          return;
+        }
+        sentinel = s;
+      } catch (err) {
+        console.warn("[wakelock] denied", err);
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void acquire();
+    };
+    void acquire();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (sentinel) void sentinel.release();
+    };
+  }, [hasActiveTransfer]);
+
+
   // ---------- UI ----------
 
   const isConnected = connStatus === "connected";
