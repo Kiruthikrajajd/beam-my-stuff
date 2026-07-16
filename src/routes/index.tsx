@@ -41,7 +41,50 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-type Meta = { kind: "meta"; name: string; size: number; type: string; id: string };
+// Chained SHA-256 over fixed-size chunks. Not a plain file SHA-256, but a
+// deterministic strong integrity hash both sides can compute incrementally
+// without loading the whole file into memory. Chunks must be sliced at the
+// same size on both sides (CHUNK_SIZE) for hashes to match — which they are.
+async function digestBytes(bytes: BufferSource): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+async function foldChunkIntoHash(
+  state: Uint8Array,
+  chunk: BufferSource,
+): Promise<Uint8Array> {
+  const chunkHash = await digestBytes(chunk);
+  const combined = new Uint8Array(state.length + chunkHash.length);
+  combined.set(state, 0);
+  combined.set(chunkHash, state.length);
+  return digestBytes(combined);
+}
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+async function hashFileChained(
+  file: File,
+  chunkSize: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<string> {
+  let state = new Uint8Array(32);
+  for (let off = 0; off < file.size; off += chunkSize) {
+    const buf = await file.slice(off, off + chunkSize).arrayBuffer();
+    state = await foldChunkIntoHash(state, buf);
+    onProgress?.(Math.min(off + chunkSize, file.size), file.size);
+  }
+  return toHex(state);
+}
+
+type Meta = {
+  kind: "meta";
+  name: string;
+  size: number;
+  type: string;
+  id: string;
+  sha256?: string; // chained SHA-256 (see hashFileChained)
+};
 type Done = { kind: "done"; id: string };
 type ResumeState = {
   kind: "resume-state";
@@ -51,6 +94,16 @@ type ResumeState = {
 };
 type Signal = Meta | Done | ResumeState;
 
+type TransferStatus =
+  | "hashing"
+  | "transferring"
+  | "paused"
+  | "verifying"
+  | "verified"
+  | "corrupted"
+  | "done" // fallback: transferred but no hash available to verify
+  | "error";
+
 type Transfer = {
   id: string;
   name: string;
@@ -58,9 +111,11 @@ type Transfer = {
   type: string;
   direction: "in" | "out";
   received: number;
-  status: "transferring" | "paused" | "done" | "error";
+  status: TransferStatus;
+  hashProgress?: number; // 0..1 for hashing/verifying states
   url?: string;
 };
+
 
 function Index() {
   const [myId, setMyId] = useState<string>("");
