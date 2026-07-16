@@ -381,15 +381,36 @@ function Index() {
         type: entry.meta.type || "application/octet-stream",
       });
       const url = URL.createObjectURL(blob);
+      const expected = entry.meta.sha256;
+      // Move to verifying while we drain the pending hash chain.
       setTransfers((prev) =>
         prev.map((t) =>
           t.id === sig.id
-            ? { ...t, status: "done", received: entry.meta.size, url }
+            ? { ...t, status: "verifying", received: entry.meta.size, url }
             : t,
         ),
       );
+      const hashPromise = entry.hashPromise;
       delete incomingRef.current[sig.id];
       if (activeIncomingIdRef.current === sig.id) activeIncomingIdRef.current = null;
+      void (async () => {
+        try {
+          const actual = toHex(await hashPromise);
+          const status: TransferStatus = !expected
+            ? "done"
+            : actual === expected
+              ? "verified"
+              : "corrupted";
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === sig.id ? { ...t, status } : t)),
+          );
+        } catch (err) {
+          console.error("[verify]", err);
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === sig.id ? { ...t, status: "error" } : t)),
+          );
+        }
+      })();
     } else if (sig.kind === "resume-state") {
       // Peer told us how many bytes it has for each in-flight transfer.
       // Any of our outgoing transfers matching these ids should resume from
