@@ -94,10 +94,6 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { rel: "manifest", href: "/manifest.webmanifest" },
       { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
     ],
-    scripts: [],
-  }),
-  // Note: theme-color is set via a meta tag added by vite-plugin-pwa in the manifest.
-
   }),
   shellComponent: RootShell,
   component: RootComponent,
