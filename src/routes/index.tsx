@@ -10,7 +10,7 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Peer-to-peer file transfer between phone, tablet, laptop and desktop. No sign-up, no size limits — files go straight from device to device.",
+          "Peer-to-peer file transfer between phone, tablet, laptop and desktop. Auto-resumes if the connection drops.",
       },
       { property: "og:title", content: "Beam — Send files between any device" },
       {
@@ -27,6 +27,8 @@ export const Route = createFileRoute("/")({
 
 const CHUNK_SIZE = 64 * 1024;
 const ID_PREFIX = "beam-";
+const RECONNECT_DELAY_MS = 1500;
+const MAX_RECONNECT_ATTEMPTS = 20;
 
 function shortId() {
   return Math.random().toString(36).slice(2, 6) + Math.random().toString(36).slice(2, 6);
@@ -41,7 +43,13 @@ function formatBytes(bytes: number) {
 
 type Meta = { kind: "meta"; name: string; size: number; type: string; id: string };
 type Done = { kind: "done"; id: string };
-type Signal = Meta | Done;
+type ResumeState = {
+  kind: "resume-state";
+  // For every transfer this peer is receiving that isn't yet complete,
+  // report how many bytes it already has. The sender resumes from there.
+  incoming: { id: string; received: number }[];
+};
+type Signal = Meta | Done | ResumeState;
 
 type Transfer = {
   id: string;
@@ -50,7 +58,7 @@ type Transfer = {
   type: string;
   direction: "in" | "out";
   received: number;
-  status: "transferring" | "done" | "error";
+  status: "transferring" | "paused" | "done" | "error";
   url?: string;
 };
 
@@ -58,20 +66,44 @@ function Index() {
   const [myId, setMyId] = useState<string>("");
   const [peerReady, setPeerReady] = useState(false);
   const [remoteId, setRemoteId] = useState("");
-  const [conn, setConn] = useState<DataConnection | null>(null);
-  const [connStatus, setConnStatus] = useState<"idle" | "connecting" | "connected" | "error">(
-    "idle",
-  );
+  const [connStatus, setConnStatus] = useState<
+    "idle" | "connecting" | "connected" | "reconnecting" | "error"
+  >("idle");
   const [error, setError] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [dragOver, setDragOver] = useState(false);
 
   const peerRef = useRef<Peer | null>(null);
-  const incomingRef = useRef<
-    Record<string, { meta: Meta; chunks: BlobPart[]; received: number }>
-  >({});
+  const connRef = useRef<DataConnection | null>(null);
+  // Peer we are/were connected to (short form, no prefix). Used for auto-reconnect.
+  const remotePeerRef = useRef<string | null>(null);
+  // True if this side initiated the connection — only initiator auto-reconnects
+  // to avoid duplicate connection races.
+  const initiatedRef = useRef(false);
+  const userDisconnectedRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Init Peer
+  // Incoming: chunks are appended as they arrive; survives reconnects.
+  const incomingRef = useRef<
+    Record<string, { meta: Meta; chunks: ArrayBuffer[]; received: number }>
+  >({});
+  // Which incoming id is currently receiving binary chunks (set by the last "meta"
+  // received or by a resume announcement).
+  const activeIncomingIdRef = useRef<string | null>(null);
+
+  // Outgoing: the File plus how much has been ack'd/known-received by the peer.
+  const outgoingRef = useRef<
+    Record<string, { file: File; meta: Meta; offset: number; done: boolean }>
+  >({});
+  // Resume offsets reported by peer on (re)connect, keyed by transfer id.
+  // Consumed by active send loops which check it after every await.
+  const resumeOffsetsRef = useRef<Record<string, number>>({});
+  // Resolvers waiting for the next successful (re)connection.
+  const connectWaitersRef = useRef<Array<() => void>>([]);
+
+  // ---------- Peer lifecycle ----------
+
   useEffect(() => {
     const id = ID_PREFIX + shortId();
     const peer = new Peer(id, { debug: 1 });
@@ -82,102 +114,244 @@ function Index() {
       setPeerReady(true);
     });
     peer.on("error", (err) => {
-      console.error(err);
-      setError(err.message || "Connection error");
+      console.error("[peer error]", err);
+      // "peer-unavailable" during reconnect: keep trying, don't surface as fatal.
+      const msg = err.message || String(err);
+      if (connStatus === "reconnecting" && /unavailable/i.test(msg)) return;
+      setError(msg);
       setConnStatus((s) => (s === "connecting" ? "error" : s));
     });
+    peer.on("disconnected", () => {
+      // Peer lost signaling — try to reconnect to the broker so we can
+      // re-establish or accept data connections again.
+      try {
+        peer.reconnect();
+      } catch {
+        /* ignore */
+      }
+    });
     peer.on("connection", (incoming) => {
+      // Remote initiated. Remember them so we can reconnect if they drop.
+      remotePeerRef.current = incoming.peer.replace(ID_PREFIX, "");
+      initiatedRef.current = false;
       wireConnection(incoming);
     });
 
     return () => {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       peer.destroy();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ---------- Connection wiring + resume handshake ----------
+
   function wireConnection(c: DataConnection) {
-    setConnStatus("connecting");
+    setConnStatus((s) => (s === "reconnecting" ? "reconnecting" : "connecting"));
+
     c.on("open", () => {
-      setConn(c);
+      connRef.current = c;
+      reconnectAttemptsRef.current = 0;
+      setRemoteId(remotePeerRef.current ?? "");
       setConnStatus("connected");
       setError(null);
+
+      // Announce which incoming transfers are still in flight so the peer
+      // knows where to resume its outgoing sends.
+      const incoming = Object.entries(incomingRef.current)
+        .filter(([, v]) => v.received < v.meta.size)
+        .map(([id, v]) => ({ id, received: v.received }));
+      const msg: ResumeState = { kind: "resume-state", incoming };
+      try {
+        c.send(msg);
+      } catch (err) {
+        console.error("[send resume-state]", err);
+      }
+
+      // Wake any senders that were paused waiting for a live connection.
+      const waiters = connectWaitersRef.current;
+      connectWaitersRef.current = [];
+      waiters.forEach((w) => w());
     });
-    c.on("close", () => {
-      setConn(null);
-      setConnStatus("idle");
-    });
-    c.on("error", (err) => {
-      console.error(err);
-      setError(err.message || "Connection error");
-      setConnStatus("error");
-    });
+
     c.on("data", (data) => handleData(data));
+
+    c.on("close", () => {
+      connRef.current = null;
+      // Anything in-flight is now paused.
+      setTransfers((prev) =>
+        prev.map((t) => (t.status === "transferring" ? { ...t, status: "paused" } : t)),
+      );
+      if (userDisconnectedRef.current) {
+        userDisconnectedRef.current = false;
+        setConnStatus("idle");
+        remotePeerRef.current = null;
+        return;
+      }
+      // Auto-reconnect only if we initiated originally and still know the peer.
+      if (initiatedRef.current && remotePeerRef.current) {
+        scheduleReconnect();
+      } else {
+        // The remote side (which initiated) will retry to us. Show "reconnecting"
+        // as long as we still have live transfers to resume.
+        const hasPending =
+          Object.values(incomingRef.current).some((v) => v.received < v.meta.size) ||
+          Object.values(outgoingRef.current).some((v) => !v.done);
+        setConnStatus(hasPending ? "reconnecting" : "idle");
+      }
+    });
+
+    c.on("error", (err) => {
+      console.error("[conn error]", err);
+      setError(err.message || "Connection error");
+    });
   }
 
-  function handleData(data: unknown) {
-    if (data instanceof ArrayBuffer || (data && (data as ArrayBufferView).byteLength !== undefined && !(data as { kind?: string }).kind)) {
-      // binary chunk — belongs to the current active incoming transfer (the oldest not done)
-      const activeId = Object.keys(incomingRef.current).find(
-        (k) => incomingRef.current[k].received < incomingRef.current[k].meta.size,
+  function scheduleReconnect() {
+    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      setConnStatus("error");
+      setError("Could not reconnect. Ask the other device to reconnect.");
+      // Fail any still-pending transfers so the UI is honest.
+      setTransfers((prev) =>
+        prev.map((t) => (t.status === "paused" ? { ...t, status: "error" } : t)),
       );
+      return;
+    }
+    setConnStatus("reconnecting");
+    const attempt = ++reconnectAttemptsRef.current;
+    const delay = Math.min(RECONNECT_DELAY_MS * attempt, 10_000);
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = setTimeout(() => {
+      const peer = peerRef.current;
+      const target = remotePeerRef.current;
+      if (!peer || !target) return;
+      if (peer.disconnected) {
+        try {
+          peer.reconnect();
+        } catch {
+          /* ignore */
+        }
+      }
+      const c = peer.connect(ID_PREFIX + target, { reliable: true });
+      wireConnection(c);
+    }, delay);
+  }
+
+  function waitForConnection(): Promise<void> {
+    if (connRef.current && connRef.current.open) return Promise.resolve();
+    return new Promise((resolve) => {
+      connectWaitersRef.current.push(resolve);
+    });
+  }
+
+  // ---------- Incoming data handling ----------
+
+  function handleData(data: unknown) {
+    // Binary chunk: ArrayBuffer or a typed-array view.
+    if (
+      data instanceof ArrayBuffer ||
+      (typeof data === "object" &&
+        data !== null &&
+        ArrayBuffer.isView(data as ArrayBufferView) &&
+        !(data as { kind?: string }).kind)
+    ) {
+      const view = data instanceof ArrayBuffer ? null : (data as ArrayBufferView);
+      const buf: ArrayBuffer =
+        data instanceof ArrayBuffer
+          ? data
+          : (view!.buffer.slice(
+              view!.byteOffset,
+              view!.byteOffset + view!.byteLength,
+            ) as ArrayBuffer);
+      const activeId = activeIncomingIdRef.current;
       if (!activeId) return;
       const entry = incomingRef.current[activeId];
-      const buf = data as ArrayBuffer;
+      if (!entry) return;
       entry.chunks.push(buf);
-      entry.received += (buf as ArrayBuffer).byteLength;
+      entry.received += buf.byteLength;
       setTransfers((prev) =>
-        prev.map((t) => (t.id === activeId ? { ...t, received: entry.received } : t)),
+        prev.map((t) =>
+          t.id === activeId ? { ...t, received: entry.received, status: "transferring" } : t,
+        ),
       );
       return;
     }
     const sig = data as Signal;
     if (sig.kind === "meta") {
-      incomingRef.current[sig.id] = { meta: sig, chunks: [], received: 0 };
-      setTransfers((prev) => [
-        {
-          id: sig.id,
-          name: sig.name,
-          size: sig.size,
-          type: sig.type,
-          direction: "in",
-          received: 0,
-          status: "transferring",
-        },
-        ...prev,
-      ]);
+      // A fresh transfer — or an announcement that this id is what follows next.
+      if (!incomingRef.current[sig.id]) {
+        incomingRef.current[sig.id] = { meta: sig, chunks: [], received: 0 };
+        setTransfers((prev) => [
+          {
+            id: sig.id,
+            name: sig.name,
+            size: sig.size,
+            type: sig.type,
+            direction: "in",
+            received: 0,
+            status: "transferring",
+          },
+          ...prev,
+        ]);
+      }
+      activeIncomingIdRef.current = sig.id;
     } else if (sig.kind === "done") {
       const entry = incomingRef.current[sig.id];
       if (!entry) return;
-      const blob = new Blob(entry.chunks, { type: entry.meta.type || "application/octet-stream" });
+      const blob = new Blob(entry.chunks, {
+        type: entry.meta.type || "application/octet-stream",
+      });
       const url = URL.createObjectURL(blob);
       setTransfers((prev) =>
         prev.map((t) =>
-          t.id === sig.id ? { ...t, status: "done", received: entry.meta.size, url } : t,
+          t.id === sig.id
+            ? { ...t, status: "done", received: entry.meta.size, url }
+            : t,
         ),
       );
       delete incomingRef.current[sig.id];
+      if (activeIncomingIdRef.current === sig.id) activeIncomingIdRef.current = null;
+    } else if (sig.kind === "resume-state") {
+      // Peer told us how many bytes it has for each in-flight transfer.
+      // Any of our outgoing transfers matching these ids should resume from
+      // that offset. Any outgoing NOT listed by the peer is assumed lost on
+      // their side — we rewind to 0 to be safe.
+      const map: Record<string, number> = {};
+      for (const item of sig.incoming) map[item.id] = item.received;
+      for (const [id, out] of Object.entries(outgoingRef.current)) {
+        if (out.done) continue;
+        resumeOffsetsRef.current[id] = map[id] ?? 0;
+      }
     }
   }
+
+  // ---------- Connect / disconnect actions ----------
 
   function connectToPeer() {
     if (!peerRef.current || !remoteId.trim()) return;
     setError(null);
     setConnStatus("connecting");
-    const c = peerRef.current.connect(ID_PREFIX + remoteId.trim().toLowerCase(), {
-      reliable: true,
-    });
+    initiatedRef.current = true;
+    userDisconnectedRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    remotePeerRef.current = remoteId.trim().toLowerCase();
+    const c = peerRef.current.connect(ID_PREFIX + remotePeerRef.current, { reliable: true });
     wireConnection(c);
   }
 
   function disconnect() {
-    conn?.close();
-    setConn(null);
+    userDisconnectedRef.current = true;
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    connRef.current?.close();
+    connRef.current = null;
+    remotePeerRef.current = null;
+    setRemoteId("");
     setConnStatus("idle");
   }
 
+  // ---------- Sending ----------
+
   async function sendFiles(files: FileList | File[]) {
-    if (!conn) return;
     for (const file of Array.from(files)) {
       const id = crypto.randomUUID();
       const meta: Meta = {
@@ -187,7 +361,7 @@ function Index() {
         size: file.size,
         type: file.type,
       };
-      conn.send(meta);
+      outgoingRef.current[id] = { file, meta, offset: 0, done: false };
       setTransfers((prev) => [
         {
           id,
@@ -200,40 +374,123 @@ function Index() {
         },
         ...prev,
       ]);
-      let offset = 0;
-      while (offset < file.size) {
-        const slice = file.slice(offset, offset + CHUNK_SIZE);
-        const buf = await slice.arrayBuffer();
-        // backpressure
-        const dc = (conn as unknown as { dataChannel?: RTCDataChannel }).dataChannel;
-        while (dc && dc.bufferedAmount > 16 * 1024 * 1024) {
-          await new Promise((r) => setTimeout(r, 50));
-        }
-        conn.send(buf);
-        offset += buf.byteLength;
-        const sent = offset;
-        setTransfers((prev) => prev.map((t) => (t.id === id ? { ...t, received: sent } : t)));
-      }
-      const done: Done = { kind: "done", id };
-      conn.send(done);
-      setTransfers((prev) =>
-        prev.map((t) => (t.id === id ? { ...t, status: "done", received: file.size } : t)),
-      );
+      // Fire and forget; each send loop is resilient to disconnects.
+      void sendFileLoop(id);
     }
   }
+
+  async function sendFileLoop(id: string) {
+    const entry = outgoingRef.current[id];
+    if (!entry) return;
+    const { file, meta } = entry;
+
+    // Every time we (re)start streaming this file we must re-announce the meta
+    // so the receiver routes subsequent binary chunks to the right transfer.
+    let announced = false;
+
+    while (entry.offset < file.size) {
+      // Wait for a live connection.
+      if (!connRef.current || !connRef.current.open) {
+        setTransfers((prev) =>
+          prev.map((t) => (t.id === id ? { ...t, status: "paused" } : t)),
+        );
+        await waitForConnection();
+        announced = false; // must re-announce after reconnect
+      }
+
+      // If the peer told us a resume offset, honor it (might be lower than
+      // our optimistic local offset — the peer is the source of truth).
+      if (resumeOffsetsRef.current[id] !== undefined) {
+        entry.offset = resumeOffsetsRef.current[id];
+        delete resumeOffsetsRef.current[id];
+        setTransfers((prev) =>
+          prev.map((t) => (t.id === id ? { ...t, received: entry.offset } : t)),
+        );
+      }
+
+      const conn = connRef.current;
+      if (!conn || !conn.open) continue;
+
+      if (!announced) {
+        try {
+          conn.send(meta);
+          announced = true;
+        } catch (err) {
+          console.error("[re-announce meta]", err);
+          continue;
+        }
+      }
+
+      // Backpressure on the underlying data channel.
+      const dc = (conn as unknown as { dataChannel?: RTCDataChannel }).dataChannel;
+      if (dc && dc.bufferedAmount > 16 * 1024 * 1024) {
+        await new Promise((r) => setTimeout(r, 50));
+        continue;
+      }
+
+      const end = Math.min(entry.offset + CHUNK_SIZE, file.size);
+      const slice = file.slice(entry.offset, end);
+      let buf: ArrayBuffer;
+      try {
+        buf = await slice.arrayBuffer();
+      } catch (err) {
+        console.error("[read file]", err);
+        setTransfers((prev) =>
+          prev.map((t) => (t.id === id ? { ...t, status: "error" } : t)),
+        );
+        return;
+      }
+
+      // Re-check the connection after the async read.
+      if (!connRef.current || !connRef.current.open) continue;
+
+      try {
+        connRef.current.send(buf);
+      } catch (err) {
+        console.error("[send chunk]", err);
+        continue; // loop will wait for reconnect
+      }
+      entry.offset = end;
+      setTransfers((prev) =>
+        prev.map((t) =>
+          t.id === id ? { ...t, received: entry.offset, status: "transferring" } : t,
+        ),
+      );
+    }
+
+    // Signal completion (idempotent — receiver ignores unknown ids).
+    const done: Done = { kind: "done", id };
+    try {
+      if (connRef.current?.open) connRef.current.send(done);
+    } catch (err) {
+      console.error("[send done]", err);
+    }
+    entry.done = true;
+    setTransfers((prev) =>
+      prev.map((t) =>
+        t.id === id ? { ...t, status: "done", received: file.size } : t,
+      ),
+    );
+  }
+
+  // ---------- URL / QR ----------
 
   const shareUrl = useMemo(() => {
     if (typeof window === "undefined" || !myId) return "";
     return `${window.location.origin}/?peer=${myId}`;
   }, [myId]);
 
-  // Auto-fill from ?peer=
   useEffect(() => {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
     const p = params.get("peer");
     if (p) setRemoteId(p);
   }, []);
+
+  // ---------- UI ----------
+
+  const isConnected = connStatus === "connected";
+  const isReconnecting = connStatus === "reconnecting";
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -249,7 +506,7 @@ function Index() {
             </div>
           </div>
           <span className="hidden text-xs text-muted-foreground sm:block">
-            End-to-end encrypted · WebRTC
+            End-to-end encrypted · WebRTC · Auto-resume
           </span>
         </header>
 
@@ -259,7 +516,8 @@ function Index() {
           </h2>
           <p className="mt-4 text-base text-muted-foreground md:text-lg">
             Open Beam on both devices. Share the code — files stream peer-to-peer over an encrypted
-            WebRTC channel. Nothing touches a server.
+            WebRTC channel. If the connection drops, transfers resume automatically from where they
+            stopped.
           </p>
         </section>
 
@@ -306,7 +564,7 @@ function Index() {
             <h3 className="mb-4 text-sm font-medium uppercase tracking-wider text-muted-foreground">
               Connect to a device
             </h3>
-            {connStatus !== "connected" ? (
+            {!isConnected && !isReconnecting ? (
               <div className="space-y-3">
                 <input
                   value={remoteId}
@@ -326,13 +584,35 @@ function Index() {
               </div>
             ) : (
               <div>
-                <div className="flex items-center gap-2 text-emerald-600">
+                <div
+                  className={`flex items-center gap-2 ${
+                    isReconnecting ? "text-amber-600" : "text-emerald-600"
+                  }`}
+                >
                   <span className="relative flex h-2.5 w-2.5">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
-                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
+                    <span
+                      className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-60 ${
+                        isReconnecting ? "bg-amber-500" : "bg-emerald-500"
+                      }`}
+                    />
+                    <span
+                      className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
+                        isReconnecting ? "bg-amber-500" : "bg-emerald-500"
+                      }`}
+                    />
                   </span>
-                  <span className="text-sm font-medium">Connected to {remoteId}</span>
+                  <span className="text-sm font-medium">
+                    {isReconnecting
+                      ? `Reconnecting to ${remotePeerRef.current ?? "peer"}…`
+                      : `Connected to ${remoteId}`}
+                  </span>
                 </div>
+                {isReconnecting && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Attempt {reconnectAttemptsRef.current} of {MAX_RECONNECT_ATTEMPTS}. Transfers
+                    will resume automatically.
+                  </p>
+                )}
                 <button
                   onClick={disconnect}
                   className="mt-4 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-accent"
@@ -354,22 +634,22 @@ function Index() {
           onDrop={(e) => {
             e.preventDefault();
             setDragOver(false);
-            if (conn && e.dataTransfer.files.length) sendFiles(e.dataTransfer.files);
+            if (isConnected && e.dataTransfer.files.length) sendFiles(e.dataTransfer.files);
           }}
           className={`mt-6 rounded-3xl border-2 border-dashed p-10 text-center transition-colors ${
             dragOver ? "border-primary bg-primary/5" : "border-border bg-card/50"
-          } ${!conn ? "opacity-60" : ""}`}
+          } ${!isConnected ? "opacity-60" : ""}`}
         >
           <div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-primary/10 text-primary">
             <UploadIcon />
           </div>
           <p className="mt-4 text-base font-medium">
-            {conn ? "Drop files here to send" : "Connect a device to start sending"}
+            {isConnected ? "Drop files here to send" : "Connect a device to start sending"}
           </p>
           <p className="mt-1 text-sm text-muted-foreground">or</p>
           <label
             className={`mt-3 inline-flex cursor-pointer rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background ${
-              !conn ? "pointer-events-none" : ""
+              !isConnected ? "pointer-events-none" : ""
             }`}
           >
             Choose files
@@ -390,6 +670,22 @@ function Index() {
             </h3>
             {transfers.map((t) => {
               const pct = t.size ? Math.min(100, (t.received / t.size) * 100) : 0;
+              const barColor =
+                t.status === "done"
+                  ? "bg-emerald-500"
+                  : t.status === "paused"
+                    ? "bg-amber-500"
+                    : t.status === "error"
+                      ? "bg-destructive"
+                      : "bg-primary";
+              const statusText =
+                t.status === "done"
+                  ? " · Complete"
+                  : t.status === "paused"
+                    ? " · Paused, will resume"
+                    : t.status === "error"
+                      ? " · Failed"
+                      : "";
               return (
                 <div key={t.id} className="rounded-2xl border bg-card p-4">
                   <div className="flex items-center gap-3">
@@ -406,7 +702,7 @@ function Index() {
                       <p className="truncate text-sm font-medium">{t.name}</p>
                       <p className="text-xs text-muted-foreground">
                         {formatBytes(t.received)} / {formatBytes(t.size)}
-                        {t.status === "done" && " · Complete"}
+                        {statusText}
                       </p>
                     </div>
                     {t.status === "done" && t.direction === "in" && t.url && (
@@ -421,9 +717,7 @@ function Index() {
                   </div>
                   <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
                     <div
-                      className={`h-full transition-all ${
-                        t.status === "done" ? "bg-emerald-500" : "bg-primary"
-                      }`}
+                      className={`h-full transition-all ${barColor}`}
                       style={{ width: `${pct}%` }}
                     />
                   </div>
@@ -434,7 +728,8 @@ function Index() {
         )}
 
         <footer className="mt-16 border-t pt-6 text-center text-xs text-muted-foreground">
-          Files never leave your devices — transfers are peer-to-peer via WebRTC.
+          Files never leave your devices — transfers are peer-to-peer via WebRTC, and resume
+          automatically if the connection drops.
         </footer>
       </div>
     </div>
