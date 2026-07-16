@@ -41,7 +41,51 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-type Meta = { kind: "meta"; name: string; size: number; type: string; id: string };
+// Chained SHA-256 over fixed-size chunks. Not a plain file SHA-256, but a
+// deterministic strong integrity hash both sides can compute incrementally
+// without loading the whole file into memory. Chunks must be sliced at the
+// same size on both sides (CHUNK_SIZE) for hashes to match — which they are.
+async function digestBytes(bytes: BufferSource): Promise<Uint8Array<ArrayBuffer>> {
+  const d = await crypto.subtle.digest("SHA-256", bytes);
+  return new Uint8Array(d);
+}
+async function foldChunkIntoHash(
+  state: Uint8Array<ArrayBuffer>,
+  chunk: BufferSource,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const chunkHash = await digestBytes(chunk);
+  const combined = new Uint8Array(state.length + chunkHash.length);
+  combined.set(state, 0);
+  combined.set(chunkHash, state.length);
+  return digestBytes(combined);
+}
+function toHex(bytes: Uint8Array<ArrayBuffer>): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+async function hashFileChained(
+  file: File,
+  chunkSize: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<string> {
+  let state = new Uint8Array(new ArrayBuffer(32));
+  for (let off = 0; off < file.size; off += chunkSize) {
+    const buf = await file.slice(off, off + chunkSize).arrayBuffer();
+    state = await foldChunkIntoHash(state, buf);
+    onProgress?.(Math.min(off + chunkSize, file.size), file.size);
+  }
+  return toHex(state);
+}
+
+type Meta = {
+  kind: "meta";
+  name: string;
+  size: number;
+  type: string;
+  id: string;
+  sha256?: string; // chained SHA-256 (see hashFileChained)
+};
 type Done = { kind: "done"; id: string };
 type ResumeState = {
   kind: "resume-state";
@@ -51,6 +95,16 @@ type ResumeState = {
 };
 type Signal = Meta | Done | ResumeState;
 
+type TransferStatus =
+  | "hashing"
+  | "transferring"
+  | "paused"
+  | "verifying"
+  | "verified"
+  | "corrupted"
+  | "done" // fallback: transferred but no hash available to verify
+  | "error";
+
 type Transfer = {
   id: string;
   name: string;
@@ -58,9 +112,11 @@ type Transfer = {
   type: string;
   direction: "in" | "out";
   received: number;
-  status: "transferring" | "paused" | "done" | "error";
+  status: TransferStatus;
+  hashProgress?: number; // 0..1 for hashing/verifying states
   url?: string;
 };
+
 
 function Index() {
   const [myId, setMyId] = useState<string>("");
@@ -85,8 +141,18 @@ function Index() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Incoming: chunks are appended as they arrive; survives reconnects.
+  // hashPromise is a chained promise that folds every chunk into a running
+  // SHA-256 state as it arrives, so verification cost is amortized.
   const incomingRef = useRef<
-    Record<string, { meta: Meta; chunks: ArrayBuffer[]; received: number }>
+    Record<
+      string,
+      {
+        meta: Meta;
+        chunks: ArrayBuffer[];
+        received: number;
+        hashPromise: Promise<Uint8Array<ArrayBuffer>>;
+      }
+    >
   >({});
   // Which incoming id is currently receiving binary chunks (set by the last "meta"
   // received or by a resume announcement).
@@ -269,6 +335,10 @@ function Index() {
       if (!entry) return;
       entry.chunks.push(buf);
       entry.received += buf.byteLength;
+      // Fold the chunk into the running hash without blocking the receive path.
+      entry.hashPromise = entry.hashPromise.then((state) =>
+        foldChunkIntoHash(state, buf),
+      );
       setTransfers((prev) =>
         prev.map((t) =>
           t.id === activeId ? { ...t, received: entry.received, status: "transferring" } : t,
@@ -280,7 +350,12 @@ function Index() {
     if (sig.kind === "meta") {
       // A fresh transfer — or an announcement that this id is what follows next.
       if (!incomingRef.current[sig.id]) {
-        incomingRef.current[sig.id] = { meta: sig, chunks: [], received: 0 };
+        incomingRef.current[sig.id] = {
+          meta: sig,
+          chunks: [],
+          received: 0,
+          hashPromise: Promise.resolve(new Uint8Array(new ArrayBuffer(32))),
+        };
         setTransfers((prev) => [
           {
             id: sig.id,
@@ -293,6 +368,10 @@ function Index() {
           },
           ...prev,
         ]);
+      } else {
+        // Meta re-announced after a reconnect — update the expected hash if
+        // the sender only computed it after the first meta went out.
+        incomingRef.current[sig.id].meta = sig;
       }
       activeIncomingIdRef.current = sig.id;
     } else if (sig.kind === "done") {
@@ -302,15 +381,36 @@ function Index() {
         type: entry.meta.type || "application/octet-stream",
       });
       const url = URL.createObjectURL(blob);
+      const expected = entry.meta.sha256;
+      // Move to verifying while we drain the pending hash chain.
       setTransfers((prev) =>
         prev.map((t) =>
           t.id === sig.id
-            ? { ...t, status: "done", received: entry.meta.size, url }
+            ? { ...t, status: "verifying", received: entry.meta.size, url }
             : t,
         ),
       );
+      const hashPromise = entry.hashPromise;
       delete incomingRef.current[sig.id];
       if (activeIncomingIdRef.current === sig.id) activeIncomingIdRef.current = null;
+      void (async () => {
+        try {
+          const actual = toHex(await hashPromise);
+          const status: TransferStatus = !expected
+            ? "done"
+            : actual === expected
+              ? "verified"
+              : "corrupted";
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === sig.id ? { ...t, status } : t)),
+          );
+        } catch (err) {
+          console.error("[verify]", err);
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === sig.id ? { ...t, status: "error" } : t)),
+          );
+        }
+      })();
     } else if (sig.kind === "resume-state") {
       // Peer told us how many bytes it has for each in-flight transfer.
       // Any of our outgoing transfers matching these ids should resume from
@@ -370,12 +470,35 @@ function Index() {
           type: file.type,
           direction: "out",
           received: 0,
-          status: "transferring",
+          status: "hashing",
+          hashProgress: 0,
         },
         ...prev,
       ]);
-      // Fire and forget; each send loop is resilient to disconnects.
-      void sendFileLoop(id);
+      // Kick off hashing in parallel; send loop waits for the digest before
+      // it announces meta (so the receiver knows what to verify against).
+      void (async () => {
+        try {
+          const sha = await hashFileChained(file, CHUNK_SIZE, (done, total) => {
+            const p = total ? done / total : 1;
+            setTransfers((prev) =>
+              prev.map((t) => (t.id === id ? { ...t, hashProgress: p } : t)),
+            );
+          });
+          meta.sha256 = sha;
+          setTransfers((prev) =>
+            prev.map((t) =>
+              t.id === id ? { ...t, status: "transferring", hashProgress: 1 } : t,
+            ),
+          );
+          void sendFileLoop(id);
+        } catch (err) {
+          console.error("[hash]", err);
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === id ? { ...t, status: "error" } : t)),
+          );
+        }
+      })();
     }
   }
 
@@ -712,23 +835,46 @@ function Index() {
               Transfers
             </h3>
             {transfers.map((t) => {
-              const pct = t.size ? Math.min(100, (t.received / t.size) * 100) : 0;
+              // Progress bar reflects hashing while status === "hashing",
+              // otherwise byte progress.
+              const isHashing = t.status === "hashing";
+              const pct = isHashing
+                ? Math.round((t.hashProgress ?? 0) * 100)
+                : t.size
+                  ? Math.min(100, (t.received / t.size) * 100)
+                  : 0;
               const barColor =
-                t.status === "done"
+                t.status === "verified" || t.status === "done"
                   ? "bg-emerald-500"
-                  : t.status === "paused"
-                    ? "bg-amber-500"
-                    : t.status === "error"
-                      ? "bg-destructive"
-                      : "bg-primary";
-              const statusText =
-                t.status === "done"
-                  ? " · Complete"
-                  : t.status === "paused"
-                    ? " · Paused, will resume"
-                    : t.status === "error"
-                      ? " · Failed"
-                      : "";
+                  : t.status === "corrupted" || t.status === "error"
+                    ? "bg-destructive"
+                    : t.status === "paused"
+                      ? "bg-amber-500"
+                      : t.status === "hashing" || t.status === "verifying"
+                        ? "bg-muted-foreground/50"
+                        : "bg-primary";
+              const statusText: Record<TransferStatus, string> = {
+                hashing: " · Preparing (hashing)",
+                transferring: "",
+                paused: " · Paused, will resume",
+                verifying: " · Verifying…",
+                verified: " · Verified ✓",
+                corrupted: " · Corrupted ✗",
+                done: " · Complete",
+                error: " · Failed",
+              };
+              const badge =
+                t.status === "verified" ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600">
+                    <CheckIcon />
+                    Verified
+                  </span>
+                ) : t.status === "corrupted" ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                    <WarnIcon />
+                    Corrupted
+                  </span>
+                ) : null;
               return (
                 <div key={t.id} className="rounded-2xl border bg-card p-4">
                   <div className="flex items-center gap-3">
@@ -742,19 +888,34 @@ function Index() {
                       {t.direction === "in" ? <DownIcon /> : <UpIcon />}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">{t.name}</p>
+                      <div className="flex items-center gap-2">
+                        <p className="truncate text-sm font-medium">{t.name}</p>
+                        {badge}
+                      </div>
                       <p className="text-xs text-muted-foreground">
                         {formatBytes(t.received)} / {formatBytes(t.size)}
-                        {statusText}
+                        {statusText[t.status]}
                       </p>
                     </div>
-                    {t.status === "done" && t.direction === "in" && t.url && (
+                    {(t.status === "verified" || t.status === "done") &&
+                      t.direction === "in" &&
+                      t.url && (
+                        <a
+                          href={t.url}
+                          download={t.name}
+                          className="rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"
+                        >
+                          Save
+                        </a>
+                      )}
+                    {t.status === "corrupted" && t.direction === "in" && t.url && (
                       <a
                         href={t.url}
                         download={t.name}
-                        className="rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"
+                        className="rounded-full border border-destructive px-3 py-1.5 text-xs font-medium text-destructive"
+                        title="File failed integrity check. Save at your own risk."
                       >
-                        Save
+                        Save anyway
                       </a>
                     )}
                   </div>
@@ -802,5 +963,15 @@ function UpIcon() {
 function DownIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
+  );
+}
+function CheckIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+  );
+}
+function WarnIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
   );
 }
