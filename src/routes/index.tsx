@@ -470,12 +470,35 @@ function Index() {
           type: file.type,
           direction: "out",
           received: 0,
-          status: "transferring",
+          status: "hashing",
+          hashProgress: 0,
         },
         ...prev,
       ]);
-      // Fire and forget; each send loop is resilient to disconnects.
-      void sendFileLoop(id);
+      // Kick off hashing in parallel; send loop waits for the digest before
+      // it announces meta (so the receiver knows what to verify against).
+      void (async () => {
+        try {
+          const sha = await hashFileChained(file, CHUNK_SIZE, (done, total) => {
+            const p = total ? done / total : 1;
+            setTransfers((prev) =>
+              prev.map((t) => (t.id === id ? { ...t, hashProgress: p } : t)),
+            );
+          });
+          meta.sha256 = sha;
+          setTransfers((prev) =>
+            prev.map((t) =>
+              t.id === id ? { ...t, status: "transferring", hashProgress: 1 } : t,
+            ),
+          );
+          void sendFileLoop(id);
+        } catch (err) {
+          console.error("[hash]", err);
+          setTransfers((prev) =>
+            prev.map((t) => (t.id === id ? { ...t, status: "error" } : t)),
+          );
+        }
+      })();
     }
   }
 
